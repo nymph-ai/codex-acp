@@ -207,7 +207,18 @@ function codexResponse(
                 thread: createThread({id: "fork", sessionId: "fork"}),
             };
         case "thread/read":
-            return {thread: createThread({turns: replayTurns})};
+            return {thread: createThread({turns: replayTurns, ...(paginated ? {historyMode: "paginated"} : {})})};
+        case "thread/turns/list": {
+            if (params?.sortDirection === "desc") {
+                return {data: replayTurns.slice(-1), nextCursor: null, backwardsCursor: null};
+            }
+            const index = Number(params?.cursor ?? 0);
+            return {
+                data: replayTurns.slice(index, index + 1),
+                nextCursor: index + 1 < replayTurns.length ? String(index + 1) : null,
+                backwardsCursor: null,
+            };
+        }
         case "model/list":
             return {data: [createTestModel({id: "gpt-5"})], nextCursor: null};
         case "skills/list":
@@ -353,6 +364,62 @@ describe('ACP v2 resume replay: review-mode ids, reviewer-prompt hiding, primers
                 expect(second.codexMethods().filter(method => method === "thread/fork")).toHaveLength(1);
             } finally {
                 second.connection.close();
+            }
+        } finally {
+            first.connection.close();
+            await rm(codexHome, {recursive: true, force: true});
+        }
+    });
+
+    it.each([false, true])("resumes an inclusive native suffix across connections (paginated: %s)", async paginated => {
+        const codexHome = await mkdtemp(join(tmpdir(), "codex-acp-replay-"));
+        const replayTurns: Thread["turns"] = ["first", "second", "third"].map(id => ({
+            ...createTurn("completed", id),
+            items: [{type: "userMessage", id, clientId: `client-${id}`,
+                content: [{type: "text", text: id, text_elements: []}]}],
+        }));
+        const first = await connectV2Client({codexHome, replayTurns, paginated});
+        try {
+            await first.connection.agent.request(acpV2.methods.agent.session.resume, {
+                sessionId, cwd, replayFrom: {type: "start"},
+            });
+            const cursor = first.updates.map(({update}) => update)
+                .find(update => acpV2.SessionUpdate.isCursorUpdate(update));
+            if (!cursor || !acpV2.SessionUpdate.isCursorUpdate(cursor)) throw new Error("Missing replay cursor");
+            const replayFrom = {type: "_fabric_cursor", cursorId: cursor.cursorId} satisfies acpV2.ReplayFrom;
+
+            const next = await connectV2Client({codexHome, replayTurns, paginated});
+            try {
+                const invalid: Pick<acpV2.ResumeSessionRequest, "sessionId" | "replayFrom">[] = [
+                    {sessionId: "another-thread", replayFrom},
+                    {sessionId, replayFrom: {type: "_fabric_cursor", cursorId: "forged"}},
+                    {sessionId, replayFrom: {type: "_fabric_cursor"}},
+                ];
+                for (const wrong of invalid) {
+                    await expect(next.connection.agent.request(acpV2.methods.agent.session.resume, {cwd, ...wrong}))
+                        .rejects.toMatchObject({code: -32602});
+                }
+                expect(next.codexMethods()).not.toContain("thread/resume");
+                expect(next.updates).toEqual([]);
+                await next.connection.agent.request(acpV2.methods.agent.session.resume, {sessionId, cwd, replayFrom});
+                const messages = next.updates.map(({update}) => update)
+                    .filter(acpV2.SessionUpdate.isUserMessage)
+                    .map(update => update.messageId);
+                expect(messages).toEqual(["client-second", "client-third"]);
+                expect(next.updates.filter(({update}) => update.sessionUpdate === "replay_complete")).toHaveLength(1);
+                expect(next.updates.at(-1)?.update).toMatchObject({sessionUpdate: "state_update", state: "idle"});
+            } finally {
+                next.connection.close();
+            }
+            const changedHistory = await connectV2Client({codexHome, replayTurns: replayTurns.slice(0, 1), paginated});
+            try {
+                await expect(changedHistory.connection.agent.request(acpV2.methods.agent.session.resume, {
+                    sessionId, cwd, replayFrom,
+                })).rejects.toMatchObject({code: -32602});
+                expect(changedHistory.codexMethods()).not.toContain("thread/resume");
+                expect(changedHistory.updates).toEqual([]);
+            } finally {
+                changedHistory.connection.close();
             }
         } finally {
             first.connection.close();

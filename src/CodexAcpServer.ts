@@ -61,7 +61,7 @@ import {
 import type * as acpV2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {toV1ClientCapabilitiesView} from "./AcpV2ClientCapabilities";
 import {toV1SetSessionConfigOptionRequest, toV2ConfigOptions} from "./AcpV2ConfigOptions";
-import {issueForkCursor} from "./SessionForkCursor";
+import {type ForkBoundary, issueForkCursor, resolveCursorBoundary} from "./SessionForkCursor";
 import {toV2AvailableCommands} from "./AcpV2SessionUpdate";
 import {changesSystemPrompt, clientSystemPromptText, toV1SystemPrompt, type SessionInstructions} from "./ClientSystemPrompt";
 import {
@@ -968,6 +968,9 @@ export class CodexAcpServer {
                 ...this.initializeExtensionsMeta(2),
                 "nymph.ai/fabric": {
                     keyedTextPrompts: true,
+                    ...(this.codexAcpClient.getHomePath() !== null
+                        ? {replayFromCursor: "_fabric_cursor"}
+                        : {}),
                     ...(this.steeringKeysDirectory
                         ? {keyedTextSteering: true}
                         : {}),
@@ -1962,21 +1965,23 @@ export class CodexAcpServer {
     }
 
     /**
-     * Shared by v1 `session/load` and v2 `session/resume` with `replayFrom: {type: "start"}`:
-     * reattach, replay retained history as ordinary `session/update`s, then answer.
+     * Reattach and stream retained history for v1 load or v2 resume. A Fabric
+     * cursor narrows the stream to a validated native turn boundary.
      */
     private async loadSessionAndReplayHistory(
         params: WithAcpMcpServers<acp.LoadSessionRequest>,
+        boundary?: ForkBoundary,
     ): Promise<{
         sessionId: SessionId;
         modelState: LegacySessionModelState;
         modeState: SessionModeState;
     }> {
-        return this.withSystemPromptUpdate(params, () => this.loadSessionAndReplayHistoryOnce(params));
+        return this.withSystemPromptUpdate(params, () => this.loadSessionAndReplayHistoryOnce(params, boundary));
     }
 
     private async loadSessionAndReplayHistoryOnce(
         params: WithAcpMcpServers<acp.LoadSessionRequest>,
+        boundary?: ForkBoundary,
     ): Promise<{sessionId: SessionId; modelState: LegacySessionModelState; modeState: SessionModeState}> {
         // Captured before the load installs a fresh SessionState: a title
         // generation started by an earlier turn on this session belongs to the
@@ -1995,7 +2000,7 @@ export class CodexAcpServer {
         try {
             try {
                 const readHistory = async () => {
-                    await this.streamThreadHistory(sessionId, thread, history);
+                    await this.streamThreadHistory(sessionId, thread, history, boundary);
                     if (sessionState.subagents instanceof StandardSubagentEventRouter) {
                         await sessionState.subagents.announceLiveChildrenForReplay();
                     }
@@ -2059,10 +2064,22 @@ export class CodexAcpServer {
         // session.options is not implemented, so initial config values are not applied.
         const {replayFrom, systemPrompt, configOptions: _configOptions, ...rest} = params;
         const request = {...rest, systemPrompt: toV1SystemPrompt(systemPrompt)};
-        if (replayFrom != null && replayFrom.type !== "start") {
-            throw RequestError.invalidParams(undefined, `Unsupported replayFrom type: ${replayFrom.type}`);
-        }
         const {sessionId} = params;
+        let boundary: ForkBoundary | undefined;
+        if (replayFrom != null && replayFrom.type !== "start") {
+            if (replayFrom.type !== "_fabric_cursor") {
+                throw RequestError.invalidParams(undefined, `Unsupported replayFrom type: ${replayFrom.type}`);
+            }
+            const cursorId = replayFrom["cursorId"];
+            if (typeof cursorId !== "string") {
+                throw RequestError.invalidParams(undefined, "A Fabric replay cursor requires a cursorId");
+            }
+            const appServer = this.ensureAppServer();
+            if (appServer) await appServer;
+            boundary = await this.runWithProcessCheck(() => resolveCursorBoundary(
+                this.codexAcpClient.getHomePath(), this.codexAcpClient.appServerClient, sessionId, cursorId,
+            ));
+        }
         if (this.setupResponseOrdering && !this.sessions.has(sessionId)) this.clientDelivery.beginSessionSetup(sessionId);
         const v2 = AcpV2Connection.of(this.connection)!;
         const scopes = () => [sessionId, ...this.subagentAssociations.forRoot(sessionId).map(child => child.sessionId)];
@@ -2071,7 +2088,7 @@ export class CodexAcpServer {
             if (replayFrom == null) {
                 await this.resumeSession(request);
             } else {
-                await v2.replay.run(sessionId, () => this.loadSessionAndReplayHistory(request), signal);
+                await v2.replay.run(sessionId, () => this.loadSessionAndReplayHistory(request, boundary), signal);
             }
             await this.snapshotSessionStateV2(sessionId);
             return this.createSessionSetupResponseV2(this.getSessionState(sessionId));
@@ -3896,6 +3913,7 @@ export class CodexAcpServer {
         sessionId: string,
         thread: Thread,
         history: AsyncIterable<ThreadItemEntry[]>,
+        boundary?: ForkBoundary,
     ): Promise<void> {
         const session = new ACPSessionConnection(this.connection, sessionId);
         const sessionState = this.getSessionState(sessionId);
@@ -3909,9 +3927,10 @@ export class CodexAcpServer {
         const entryPages = pagesStartingWith(firstPage, pages);
         // Hiding the `/review` reviewer prompt is a v2-only change (user decision): v1 keeps
         // showing it, as it always has.
+        const effectivePages = this.protocolVersion === 2
+            ? withoutReviewerPrompts(withForkBoundaries(entryPages)) : entryPages;
         const historyPages = untilSessionClose(
-            this.protocolVersion === 2 ? withoutReviewerPrompts(withForkBoundaries(entryPages)) : entryPages,
-            isOpen,
+            boundary === undefined ? effectivePages : historyFromBoundary(effectivePages, boundary), isOpen,
         );
         if (this.usesStandardSubagents()) {
             await this.streamStandardHistory(sessionId, standardHistoryItems(historyPages), sessionState, isOpen);
@@ -6024,6 +6043,27 @@ async function* withForkBoundaries(pages: AsyncIterable<ThreadItemEntry[]>): Asy
             return boundary === undefined ? entry : {...entry, previousTurnId: boundary};
         });
     }
+}
+
+/** Start the replay at the inclusive before-user anchor validated against native history. */
+async function* historyFromBoundary(
+    pages: AsyncIterable<HistoryEntry[]>, boundary: ForkBoundary,
+): AsyncGenerator<HistoryEntry[]> {
+    let found = false;
+    for await (const page of pages) {
+        if (found) {
+            yield page;
+            continue;
+        }
+        const index = page.findIndex(entry => entry.turnId === boundary.turnId
+            && entry.previousTurnId === boundary.previousTurnId && entry.item.id === boundary.itemId
+            && entry.item.type === "userMessage");
+        if (index >= 0) {
+            found = true;
+            yield page.slice(index);
+        }
+    }
+    if (!found) throw RequestError.invalidParams(undefined, "Cursor disappeared from native history during resume");
 }
 
 /** A buffered reviewer prompt candidate is shown once its turn has this many items. */

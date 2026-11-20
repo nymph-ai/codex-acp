@@ -4,7 +4,7 @@ import {join} from "node:path";
 import {RequestError} from "@agentclientprotocol/sdk/unstable";
 import type {CodexAppServerClient} from "./CodexAppServerClient";
 
-type ForkBoundary = {
+export type ForkBoundary = {
     sessionId: string;
     previousTurnId: string;
     turnId: string;
@@ -39,7 +39,17 @@ export async function resolveForkCursor(
     sessionId: string,
     id: string,
 ): Promise<string> {
-    const invalid = () => RequestError.invalidParams({cursorId: id}, "Fork cursor is unavailable in this session");
+    const boundary = await resolveCursorBoundary(home, client, sessionId, id);
+    return boundary.previousTurnId;
+}
+
+export async function resolveCursorBoundary(
+    home: string | null,
+    client: CodexAppServerClient,
+    sessionId: string,
+    id: string,
+): Promise<ForkBoundary> {
+    const invalid = () => RequestError.invalidParams({cursorId: id}, "Cursor is unavailable in this session");
     if (home === null || !/^cur_[a-f0-9]{64}$/.test(id)) throw invalid();
 
     let boundary: ForkBoundary;
@@ -56,5 +66,5 @@ export async function resolveForkCursor(
     const item = thread.turns[index]?.items[0];
     if (thread.id !== sessionId || thread.turns[index - 1]?.id !== boundary.previousTurnId
         || item?.type !== "userMessage" || item.id !== boundary.itemId) throw invalid();
-    return boundary.previousTurnId;
+    return boundary;
 }
