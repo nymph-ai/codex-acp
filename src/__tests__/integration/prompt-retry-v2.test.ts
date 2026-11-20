@@ -64,6 +64,16 @@ describeIntegration("integration: ACP v2 prompt retries", () => {
             idempotencyKey: "test-submission-key",
             prompt: [{type: "text" as const, text: "Reply with OK"}],
         };
+        const image = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC";
+        const contextPrompt = {
+            idempotencyKey: "context-submission-key",
+            prompt: [
+                {type: "text", text: "Reply with OK using the additional context"},
+                {type: "resource_link", name: "reference", uri: "file:///context-fixture.txt"},
+                {type: "resource", resource: {uri: "file:///embedded-fixture.txt", text: "Retained embedded context"}},
+                {type: "image", mimeType: "image/png", data: image},
+            ],
+        } satisfies Pick<acp.PromptRequest, "idempotencyKey" | "prompt">;
         const waitForIdle = (updates: acp.UpdateSessionNotification[], session: string, count = 1) => vi.waitFor(() => {
             expect(updates.filter(({sessionId, update}) => sessionId === session
                 && acp.SessionUpdate.isStateUpdate(update) && update.state === "idle"
@@ -74,10 +84,12 @@ describeIntegration("integration: ACP v2 prompt retries", () => {
                 const {sessionId} = await agent.request(methods.session.new, {cwd});
                 const {messageId} = await agent.request(methods.session.prompt, {sessionId, ...prompt});
                 await waitForIdle(updates, sessionId);
-                const {messageId: secondMessageId} = await agent.request(methods.session.prompt, {
-                    sessionId, ...prompt, idempotencyKey: "second-submission-key",
-                });
+                const {messageId: secondMessageId} = await agent.request(methods.session.prompt, {sessionId, ...contextPrompt});
                 await waitForIdle(updates, sessionId, 2);
+                const providerInputs = JSON.stringify(mock.requests);
+                expect(providerInputs.includes("file:///context-fixture.txt")).toBe(true);
+                expect(providerInputs.includes("Retained embedded context")).toBe(true);
+                expect(/"type":"input_image","image_url":"data:image\//.test(providerInputs)).toBe(true);
                 await agent.request(methods.session.close, {sessionId});
                 return {sessionId, messageId, secondMessageId};
             });
@@ -85,14 +97,18 @@ describeIntegration("integration: ACP v2 prompt retries", () => {
                 const calls = mock.requests.length;
                 await agent.request(methods.session.resume, {cwd, sessionId});
                 await expect(agent.request(methods.session.prompt, {sessionId, ...prompt})).resolves.toEqual({messageId});
+                await expect(agent.request(methods.session.prompt, {sessionId, ...contextPrompt}))
+                    .resolves.toEqual({messageId: secondMessageId});
                 expect(mock.requests).toHaveLength(calls);
                 expect(updates.some(({update}) => acp.SessionUpdate.isUserMessageChunk(update))).toBe(false);
 
                 await agent.request(methods.session.resume, {cwd, sessionId, replayFrom: {type: "start"}});
-                const replayed = updates.filter(({update}) => acp.SessionUpdate.isUserMessageChunk(update));
-                expect(replayed).toEqual([messageId, secondMessageId]
-                    .map(id => expect.objectContaining({update: expect.objectContaining({messageId: id})})));
+                const replayed = updates.flatMap(({update}) =>
+                    acp.SessionUpdate.isUserMessageChunk(update) ? [update.messageId] : []);
+                expect([...new Set(replayed)]).toEqual([messageId, secondMessageId]);
+                expect(replayed.filter(id => id === secondMessageId)).toHaveLength(contextPrompt.prompt.length);
                 expect(JSON.stringify(updates)).not.toContain(prompt.idempotencyKey);
+                expect(JSON.stringify(updates)).not.toContain(contextPrompt.idempotencyKey);
 
                 const cursor = updates.find(({update}) => acp.SessionUpdate.isCursorUpdate(update))?.update;
                 expect(cursor).toMatchObject({anchor: {type: "user_message", messageId: secondMessageId, position: "before"}});
