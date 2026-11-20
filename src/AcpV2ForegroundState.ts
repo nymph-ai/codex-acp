@@ -15,6 +15,7 @@ export class AcpV2ForegroundState {
         private readonly notify: (state: acpV2.StateUpdate) => Promise<void>,
         running: boolean | "unknown" = false,
         private readonly background?: () => acpV2.BackgroundWork[] | null,
+        private readonly canPublish?: () => boolean,
     ) {
         this.activity = running === "unknown" ? "unknown" : running ? "running" : "idle";
     }
@@ -116,6 +117,7 @@ export class AcpV2ForegroundState {
     }
 
     private publish(state: acpV2.StateUpdate): Promise<void> {
+        if (this.canPublish?.() === false) return this.sending;
         return this.serializePublication(() => this.notify(this.withBackground(state)));
     }
 

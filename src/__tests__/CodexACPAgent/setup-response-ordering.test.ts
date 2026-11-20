@@ -33,11 +33,11 @@ it("sends the initial non-idle v2 state after the session/new response", async (
             "method" in frame && frame.method === "session/update"
             && (frame.params as {update: {sessionUpdate: string; state?: string}}).update.sessionUpdate === "state_update"
             && (frame.params as {update: {state?: string}}).update.state === "running" ? [index] : []);
-        await vi.waitFor(() => expect(runningFrames()).toHaveLength(2));
+        await vi.waitFor(() => expect(runningFrames()).toHaveLength(1));
         const response = h.wireMessages.findIndex(frame => "result" in frame
             && typeof frame.result === "object" && frame.result !== null && "sessionId" in frame.result);
-        expect(runningFrames()[0]).toBeLessThan(response);
-        expect(runningFrames()[1]).toBeGreaterThan(response);
+        expect(response).toBeGreaterThanOrEqual(0);
+        expect(runningFrames()[0]).toBeGreaterThan(response);
     } finally {
         release.resolve();
         (await connecting).connection.close();

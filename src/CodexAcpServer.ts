@@ -787,12 +787,12 @@ export class CodexAcpServer {
     captureSessionCreationPublication(sessionId: string): () => void {
         const release = this.clientDelivery.captureSessionSetupRelease(sessionId);
         return () => {
-            // A client may drop every update for an unknown session before the response.
+            // Publish the current state after the client learns the new session ID.
+            release();
             const v2 = AcpV2Connection.of(this.connection);
             void v2?.snapshotForegroundState(sessionId, true).catch(error => {
                 logger.error(`Failed to send initial foreground state for session ${sessionId}`, error);
             });
-            release();
         };
     }
 
@@ -1433,7 +1433,7 @@ export class CodexAcpServer {
         const sessionMcpServers = this.resolveSessionMcpServers(requestedMcpServers, operation === "resume");
         const currentModel = this.findCurrentModel(models, currentModelId);
         const currentModelSupportsFast = modelSupportsFast(currentModel);
-        if (this.setupResponseOrdering && operation !== "resume") this.clientDelivery.beginSessionSetup(sessionId);
+        if (this.setupResponseOrdering && operation !== "resume") this.clientDelivery.beginSessionSetup(sessionId, true);
         const availableAgentModes = AgentMode.all(
             sessionMetadata.permissionProfiles,
             sessionMetadata.approvalPolicy,

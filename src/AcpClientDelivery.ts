@@ -15,7 +15,7 @@ export class AcpClientDelivery {
     private readonly sessionRequests = new Map<string, Set<AbortController>>();
     private readonly closedSessions = new Set<string>();
     private readonly urlElicitations = new Map<string, {sessionId: string | null}>();
-    private readonly sessionSetups = new Map<string, {ready: Promise<void>; release: () => void}>();
+    private readonly sessionSetups = new Map<string, {ready: Promise<void>; release: () => void; creating: boolean}>();
     private sendElicitationCompletion: (params: unknown) => Promise<void>;
 
     constructor(
@@ -42,11 +42,15 @@ export class AcpClientDelivery {
     }
 
     /** A new session cannot open client UI until its setup response has been written. */
-    beginSessionSetup(sessionId: string): void {
+    beginSessionSetup(sessionId: string, creating = false): void {
         if (this.sessionSetups.has(sessionId)) return;
         let release!: () => void;
         const ready = new Promise<void>(resolve => { release = resolve; });
-        this.sessionSetups.set(sessionId, {ready, release});
+        this.sessionSetups.set(sessionId, {ready, release, creating});
+    }
+
+    isCreatingSession(sessionId: string): boolean {
+        return this.sessionSetups.get(sessionId)?.creating === true;
     }
 
     sessionSetupReady(sessionId: string): Promise<void> | null {

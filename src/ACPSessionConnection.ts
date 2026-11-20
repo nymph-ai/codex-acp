@@ -234,6 +234,7 @@ export class AcpV2Connection {
                 }),
                 running,
                 () => this.backgroundFor(sessionId),
+                () => !this.sessionDelivery?.isCreatingSession(sessionId),
             );
             this.foreground.set(sessionId, foreground);
         }
