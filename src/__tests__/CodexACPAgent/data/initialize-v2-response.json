@@ -92,6 +92,10 @@
           "recommendedValue"
         ]
       }
+    },
+    "nymph.ai/fabric": {
+      "keyedTextPrompts": true,
+      "replayFromCursor": "_fabric_cursor"
     }
   }
 }
