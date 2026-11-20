@@ -11,6 +11,8 @@ import {type CodexAuthRequest, getCodexAuthMethods, getCodexAuthMethodsV2, isCod
 import {clientSupportsUrlElicitation} from "./ElicitationCapabilities";
 import type {ProviderStartupConfig} from "./CodexConfigOverride";
 import {isDeepStrictEqual} from "node:util";
+import {access, constants, mkdir, open} from "node:fs/promises";
+import {dirname, isAbsolute, join} from "node:path";
 import {createMcpServerSignIn, type McpServerSignIn} from "./mcp/McpServerSignIn";
 import {getRequestedMcpServerNames, McpSessionStartup, parseMcpStartupAwaitTimeoutMs} from "./mcp/McpSessionStartup";
 import {
@@ -549,7 +551,13 @@ export class CodexAcpServer {
      * path); v1 has nothing to emit. A steer that starts a new turn instead goes through
      * `prompt()`'s own `UserMessageInsertion` tracking and never enters this map.
      */
-    private readonly pendingSteerLandings: Map<string, {sessionId: string; prompt: acp.ContentBlock[]}>;
+    private readonly pendingSteerLandings: Map<string, {
+        sessionId: string;
+        prompt: acp.ContentBlock[];
+        turnId?: string;
+        complete?: (inserted: boolean) => void;
+    }>;
+    private steeringKeysDirectory: string | undefined;
     /** Sessions with a v2 prompt that has not finished yet, including before its turn starts. */
     private readonly v2PromptsInFlight = new Set<string>();
     private readonly v2PromptKeys = new Map<string, AcpV2PromptKeys>();
@@ -903,6 +911,16 @@ export class CodexAcpServer {
         const appServer = this.ensureAppServer();
         if (appServer) await appServer;
         await this.runWithProcessCheck(() => this.codexAcpClient.initialize({clientInfo: params.info}));
+        const steeringKeys = process.env["CODEX_ACP_STEER_KEYS_DIR"];
+        if (steeringKeys && isAbsolute(steeringKeys)) {
+            try {
+                await mkdir(steeringKeys, {mode: 0o700, recursive: true});
+                await access(steeringKeys, constants.W_OK);
+                this.steeringKeysDirectory = steeringKeys;
+            } catch (error) {
+                logger.error("Keyed steering directory is unavailable", error);
+            }
+        }
         this.clientInfo = params.info;
         this.clientCapabilities = clientCapabilities;
         this.initializeRequest = {clientInfo: params.info};
@@ -948,7 +966,12 @@ export class CodexAcpServer {
             authMethods: getCodexAuthMethodsV2(clientCapabilities),
             _meta: {
                 ...this.initializeExtensionsMeta(2),
-                "nymph.ai/fabric": {keyedTextPrompts: true},
+                "nymph.ai/fabric": {
+                    keyedTextPrompts: true,
+                    ...(this.steeringKeysDirectory
+                        ? {keyedTextSteering: true}
+                        : {}),
+                },
             },
         };
     }
@@ -1866,16 +1889,20 @@ export class CodexAcpServer {
     private async trackSteerLanding(sessionState: SessionState, event: ServerNotification): Promise<void> {
         if (event.method === "turn/completed" && event.params.threadId === sessionState.sessionId) {
             for (const [clientUserMessageId, entry] of this.pendingSteerLandings) {
-                if (entry.sessionId === sessionState.sessionId) {
+                if (entry.sessionId === sessionState.sessionId
+                    && (entry.turnId === undefined || entry.turnId === event.params.turn.id)) {
                     this.pendingSteerLandings.delete(clientUserMessageId);
+                    entry.complete?.(false);
                 }
             }
             return;
         }
         for (const [clientUserMessageId, entry] of this.pendingSteerLandings) {
             if (entry.sessionId === sessionState.sessionId
-                && isInsertedUserMessage(event, sessionState.sessionId, clientUserMessageId)) {
+                && isInsertedUserMessage(event, sessionState.sessionId, clientUserMessageId)
+                && (entry.turnId === undefined || (event.method === "item/completed" && event.params.turnId === entry.turnId))) {
                 this.pendingSteerLandings.delete(clientUserMessageId);
+                entry.complete?.(true);
                 await this.emitLiveSteerUserMessage(sessionState.sessionId, clientUserMessageId, entry.prompt);
                 return;
             }
@@ -3188,6 +3215,10 @@ export class CodexAcpServer {
         });
         const sessionState = this.getSessionState(params.sessionId);
         this.assertSteerInputSupported(params, sessionState);
+        const key = params._meta?.steering?.idempotencyKey;
+        if (key !== undefined) {
+            return await this.performKeyedSteer(params, sessionState, key);
+        }
 
         // Minted fresh for every steer (both protocol versions), passed to Codex as
         // `TurnSteerParams.clientUserMessageId`/`TurnStartParams.clientUserMessageId`. It is a
@@ -3206,6 +3237,62 @@ export class CodexAcpServer {
             return {outcome: "promptRequired", reason: "noRunningTurn"};
         }
         return await this.startNewTurnFromSteering(params, clientUserMessageId);
+    }
+
+    private async performKeyedSteer(
+        params: SessionSteerRequest,
+        sessionState: SessionState,
+        key: string,
+    ): Promise<SessionSteeringResponse> {
+        const directory = this.steeringKeysDirectory;
+        if (!directory) {
+            throw RequestError.invalidParams(undefined, "keyed steering requires a durable key directory");
+        }
+        const {sessionId} = params;
+        const messageId = keyedPromptId(sessionId, JSON.stringify(["active-steer", key]));
+        const receipt = {outcome: "injected", messageId} as const;
+        const retained = async () => (await this.codexAcpClient.readRetainedPromptIds(sessionId)).has(messageId);
+        const unknown = () => new RequestError(-32603, "Codex steer insertion is unconfirmed");
+        if (await retained()) return receipt;
+        const path = join(directory, messageId);
+        const turnId = await this.getSteerableTurnId(sessionState);
+        if (!turnId) {
+            try {
+                await access(path);
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+                    return {outcome: "promptRequired", reason: "noRunningTurn"};
+                }
+                throw error;
+            }
+            if (await retained()) return receipt;
+            throw unknown();
+        }
+
+        // A retained native row is positive evidence. Its absence is inconclusive
+        // once any adapter has taken the durable right to dispatch this key.
+        if (!await claimSteerDispatch(directory, path)) {
+            if (await retained()) return receipt;
+            throw unknown();
+        }
+        let complete!: (inserted: boolean) => void;
+        const landed = new Promise<boolean>(resolve => { complete = resolve; });
+        this.pendingSteerLandings.set(messageId, {sessionId, turnId, prompt: params.prompt, complete});
+        try {
+            // The expected turn ID makes the native request incapable of waking an idle session.
+            const native = this.codexAcpClient.steerTurn({
+                threadId: sessionId, turnId, prompt: params.prompt, clientUserMessageId: messageId,
+            });
+            const accepted = await settledWithin(native, 5_000);
+            if (accepted !== "pending" && await settledWithin(landed, 20_000) === true) return receipt;
+        } catch (error) {
+            // Transport loss can occur after native dispatch.
+            logger.error("Codex could not confirm the keyed steer", error);
+        } finally {
+            this.pendingSteerLandings.delete(messageId);
+        }
+        if (await retained()) return receipt;
+        throw unknown();
     }
 
     /**
@@ -3397,6 +3484,14 @@ export class CodexAcpServer {
             throw RequestError.invalidParams(undefined, "steering _meta.steering must be an object");
         }
         const idleBehavior = steering?.["idleBehavior"];
+        const idempotencyKey = steering?.["idempotencyKey"];
+        if (idempotencyKey != null && (
+            typeof idempotencyKey !== "string" || [...idempotencyKey].length < 1 || [...idempotencyKey].length > 255
+            || this.protocolVersion !== 2 || idleBehavior !== "promptRequired"
+            || prompt.length === 0 || !prompt.every(block => isRecord(block) && block["type"] === "text" && typeof block["text"] === "string")
+        )) {
+            throw RequestError.invalidParams(undefined, "keyed steering requires ACP v2 plain text, a 1–255 character key, and promptRequired");
+        }
         if (idleBehavior !== undefined && idleBehavior !== "promptRequired") {
             throw RequestError.invalidParams(undefined, "unsupported steering idleBehavior");
         }
@@ -3404,7 +3499,7 @@ export class CodexAcpServer {
             sessionId: sessionId,
             prompt: prompt as acp.ContentBlock[],
             ...(idleBehavior === "promptRequired" ? {
-                _meta: {steering: {idleBehavior}},
+                _meta: {steering: {idleBehavior, ...(typeof idempotencyKey === "string" ? {idempotencyKey} : {})}},
             } : {}),
         };
     }
@@ -6046,4 +6141,27 @@ async function* withCommandIds(
         }
         yield items;
     }
+}
+
+async function claimSteerDispatch(directory: string, path: string): Promise<boolean> {
+    try {
+        const marker = await open(path, "wx", 0o600);
+        try {
+            await marker.sync();
+        } finally {
+            await marker.close();
+        }
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+        throw error;
+    }
+    for (const parent of [directory, dirname(directory)]) {
+        const handle = await open(parent, "r");
+        try {
+            await handle.sync();
+        } finally {
+            await handle.close();
+        }
+    }
+    return true;
 }

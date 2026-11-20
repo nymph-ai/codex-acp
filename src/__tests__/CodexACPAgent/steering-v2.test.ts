@@ -1,7 +1,13 @@
+import {mkdtemp, rm, writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {keyedPromptId} from '../../AcpV2Prompt';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {SESSION_STEERING_METHOD} from '../../AcpExtensions';
 import {
     sessionId,
+    createThread,
+    createTurn,
     connectSession,
     userMessageItem,
     itemStarted,
@@ -60,6 +66,62 @@ describe('_session/steering over ACP v2', () => {
         closeClient = null;
         vi.clearAllMocks();
         expectConformingV2SessionUpdates();
+    });
+
+    it('fences a keyed steer and waits for its native insertion in the intended turn', async () => {
+        const root = await mkdtemp(join(tmpdir(), "codex-keyed-steer-"));
+        const directory = join(root, "keys");
+        vi.stubEnv("CODEX_ACP_STEER_KEYS_DIR", directory);
+        try {
+            const client = await connectSession();
+            closeClient = () => client.connection.close();
+            const thread = {...createThread(), historyMode: "legacy"};
+            client.setCodexResponse("thread/read", async () => ({thread}));
+            const nativeCalls: string[] = [];
+            client.setCodexResponse("turn/steer", async params => {
+                const request = params as {expectedTurnId: string; clientUserMessageId: string};
+                expect(request.expectedTurnId).toEqual("turn-2");
+                nativeCalls.push(request.clientUserMessageId);
+                return {turnId: "turn-2"};
+            });
+            const request = (idempotencyKey: string) => client.request(SESSION_STEERING_METHOD, {
+                sessionId, prompt: [{type: "text", text: "a keyed channel event"}],
+                _meta: {steering: {idleBehavior: "promptRequired", idempotencyKey}},
+            });
+
+            await expect(request("one")).resolves.toEqual({outcome: "promptRequired", reason: "noRunningTurn"});
+            expect(nativeCalls).toHaveLength(0);
+            client.emit(turnStarted("turn-2"));
+            await settle();
+            const ack = vi.fn();
+            const sending = request("one").then(result => { ack(); return result; });
+            await vi.waitFor(() => expect(nativeCalls).toHaveLength(1));
+            const messageId = nativeCalls[0]!;
+            client.emit(itemStarted(userMessageItem(messageId), "turn-2"));
+            client.emit(itemCompleted(userMessageItem(messageId), "other-turn"));
+            await settle();
+            expect(ack).not.toHaveBeenCalled();
+
+            const item = userMessageItem(messageId, "a keyed channel event");
+            client.emit(itemCompleted(item, "turn-2"));
+            await expect(sending).resolves.toEqual({outcome: "injected", messageId});
+            thread.turns = [{...createTurn("completed", "turn-2"), items: [item]}];
+            client.emit(turnCompleted("turn-2"));
+            await settle();
+            await expect(request("one")).resolves.toEqual({outcome: "injected", messageId});
+
+            const unresolved = keyedPromptId(sessionId, JSON.stringify(["active-steer", "two"]));
+            await writeFile(join(directory, unresolved), "", {flag: "wx"});
+            client.emit(turnStarted("turn-3"));
+            await settle();
+            await expect(request("two")).rejects.toMatchObject({code: -32603});
+            expect(nativeCalls).toEqual([messageId]);
+        } finally {
+            closeClient?.();
+            closeClient = null;
+            vi.unstubAllEnvs();
+            await rm(root, {recursive: true, force: true});
+        }
     });
 
     it('shows a live user_message, with no extra states, when a steer injected into a v2-prompt-owned turn lands', async () => {

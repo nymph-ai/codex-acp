@@ -55,6 +55,20 @@ its normal `session/prompt` lifecycle. That request owns completion, usage, and 
 reporting. `promptRequired` does not cancel an active prompt or answer its permission
 requests.
 
+## Keyed active-turn text
+
+ACP v2 includes `_meta["nymph.ai/fabric"].keyedTextSteering` in the initialize
+response when `CODEX_ACP_STEER_KEYS_DIR` names a writable absolute directory.
+All adapter connections to the same app-server need the same persistent
+directory. Set `_meta.steering.idempotencyKey` to a stable, 1–255 character key
+and `idleBehavior` to `"promptRequired"` on a plain-text request.
+
+The adapter waits for the completed native user message in the selected turn.
+An `injected` response includes its `messageId`. A retained native message can
+supply the same receipt on a retry, even when the session is idle. A prior
+dispatch with no positive native evidence returns an error. The durable
+dispatch marker prevents submitting that event twice.
+
 ## Examples
 
 `examples/steering.ts` drives a multi-step turn and injects a steer part-way through it.

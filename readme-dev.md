@@ -338,3 +338,9 @@ the Codex config are not listed.
 - Open question for AIR: AIR's fork points match Codex item ids, but on v2 a user message's
   rendered id is the client-minted `clientId` (when the client supplied one), not the Codex item id.
   A fork at a user message would not resolve. This is flagged for AIR, not fixed here.
+
+### Keyed active-turn text
+
+`CODEX_ACP_STEER_KEYS_DIR` enables the ACP v2 keyed steering extension.
+Use a persistent absolute path shared by adapters for the same native
+app-server. See [session steering](docs/steering.md#keyed-active-turn-text).

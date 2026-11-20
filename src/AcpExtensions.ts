@@ -126,12 +126,15 @@ export type SessionSteerRequest = {
         steering?: {
             /** Leave idle input unconsumed so the host can own a normal prompt lifecycle. */
             idleBehavior?: "promptRequired";
+            /** ACP v2 text-only active-turn submission, scoped to the session. */
+            idempotencyKey?: string;
         };
     };
 }
 
 export type SessionSteeringResponse =
-    | {outcome: "injected" | "startedNewTurn" | "failed"}
+    | {outcome: "injected"; messageId?: string}
+    | {outcome: "startedNewTurn" | "failed"}
     | {outcome: "promptRequired", reason: "noRunningTurn"}
 
 export type SessionSteeringExtRequest = {
