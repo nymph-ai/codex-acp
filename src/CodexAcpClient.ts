@@ -97,7 +97,7 @@ import {type ProviderStartupConfig, configOverride, expandConfigTables, NO_PROVI
 import {disableUnsupportedSkills, withoutUnsupportedSkills} from "./UnsupportedSkills";
 export type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
 /** A null turn marks unavailable outcome metadata, not a failed turn. */
-export type RecordedSubagentEntry = {item: ThreadItem; completed: boolean; turnId?: string} | {turn: Turn | null};
+export type RecordedSubagentEntry = {item: ThreadItem; completed: boolean; turnId?: string; previousTurnId?: string} | {turn: Turn | null};
 
 /**
  * The slice of `thread/resume` the session layer consumes, plus whether Codex
@@ -757,6 +757,7 @@ export class CodexAcpClient {
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
         return await runForkSession(request, additionalDirectories, {
             codexClient: this.codexClient,
+            codexHome: this.getHomePath(),
             refreshSkills: (cwd, directories) => this.refreshSkills(cwd, directories),
             createSessionConfig: (cwd, directories, mcpServers) =>
                 this.createSessionConfig(cwd, directories, mcpServers),

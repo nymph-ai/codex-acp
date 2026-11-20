@@ -7,10 +7,12 @@ import type {ModeKind} from "./app-server/ModeKind";
 import type {Model} from "./app-server/v2";
 import type {SessionMetadata} from "./SessionMetadata";
 import type {AcpMcpServer, WithAcpMcpServers} from "./McpServerConfig";
+import {resolveForkCursor} from "./SessionForkCursor";
 import type {SessionInstructions} from "./ClientSystemPrompt";
 
 export type SessionForkDependencies = {
     codexClient: CodexAppServerClient;
+    codexHome?: string | null;
     refreshSkills(cwd: string, additionalDirectories: string[]): Promise<void>;
     createSessionConfig(
         cwd: string,
@@ -33,8 +35,10 @@ export async function forkSession(
     dependencies: SessionForkDependencies,
     instructions?: SessionInstructions,
 ): Promise<SessionMetadata> {
+    const lastTurnId = request.cursorId != null
+        ? await resolveForkCursor(dependencies.codexHome ?? null, dependencies.codexClient, request.sessionId, request.cursorId)
+        : await resolveForkTurnId(request, dependencies.codexClient);
     await dependencies.refreshSkills(request.cwd, additionalDirectories);
-    const lastTurnId = await resolveForkTurnId(request, dependencies.codexClient);
     const {config, skippedMcpServers, defaultPermissionProfileId: _defaultPermissionProfileId, ...permissionProfileMetadata} = await dependencies.createSessionConfig(
         request.cwd,
         additionalDirectories,

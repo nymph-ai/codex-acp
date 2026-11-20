@@ -174,7 +174,7 @@ requests (`_session/rename`, `_session/archive|unarchive`, `_session/list/subscr
 `session/fork` drops the
 v1 `modes` field (v2 removed the modes API in favor of config options), and forked sessions do not
 get an `available_commands_update`, matching v1. There are no new environment/config knobs specific
-to v2; it reuses the runtime environment variables above.
+to v2; it reuses the runtime environment variables above. See [session fork cursors](docs/session-fork-cursors.md) for historical forks.
 
 #### Client system prompts
 

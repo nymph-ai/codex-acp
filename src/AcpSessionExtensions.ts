@@ -1,10 +1,12 @@
+import type * as acpV2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {SessionNotification} from "@agentclientprotocol/sdk/unstable";
 import type {AsyncTaskUpdate} from "./async-tasks/AcpAsyncTasks";
 import type {StandardSubagentUpdate, SubagentSpawnedUpdate, SubagentStateUpdate} from "./subagents/AcpSubagents";
 
 /** Updates the adapter emits, including its existing AIR subagent contract. */
 export type AcpSessionUpdate =
-    | Exclude<SessionNotification["update"], {sessionUpdate: "subagent_update"}>
+    | Exclude<SessionNotification["update"], {sessionUpdate: "subagent_update" | "cursor_update"}>
+    | (acpV2.CursorUpdate & {sessionUpdate: "cursor_update"})
     | SubagentSpawnedUpdate
     | SubagentStateUpdate
     | StandardSubagentUpdate

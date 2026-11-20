@@ -64,18 +64,22 @@ describeIntegration("integration: ACP v2 prompt retries", () => {
             idempotencyKey: "test-submission-key",
             prompt: [{type: "text" as const, text: "Reply with OK"}],
         };
-        const waitForIdle = (updates: acp.UpdateSessionNotification[], session: string) => vi.waitFor(() => {
-            expect(updates.some(({sessionId, update}) => sessionId === session
+        const waitForIdle = (updates: acp.UpdateSessionNotification[], session: string, count = 1) => vi.waitFor(() => {
+            expect(updates.filter(({sessionId, update}) => sessionId === session
                 && acp.SessionUpdate.isStateUpdate(update) && update.state === "idle"
-                && "stopReason" in update && update.stopReason === "end_turn")).toBe(true);
+                && "stopReason" in update && update.stopReason === "end_turn")).toHaveLength(count);
         }, {timeout: 10_000});
         try {
-            const {sessionId, messageId} = await withAgent(async (agent, updates) => {
+            const {sessionId, messageId, secondMessageId} = await withAgent(async (agent, updates) => {
                 const {sessionId} = await agent.request(methods.session.new, {cwd});
                 const {messageId} = await agent.request(methods.session.prompt, {sessionId, ...prompt});
                 await waitForIdle(updates, sessionId);
+                const {messageId: secondMessageId} = await agent.request(methods.session.prompt, {
+                    sessionId, ...prompt, idempotencyKey: "second-submission-key",
+                });
+                await waitForIdle(updates, sessionId, 2);
                 await agent.request(methods.session.close, {sessionId});
-                return {sessionId, messageId};
+                return {sessionId, messageId, secondMessageId};
             });
             await withAgent(async (agent, updates) => {
                 const calls = mock.requests.length;
@@ -86,10 +90,18 @@ describeIntegration("integration: ACP v2 prompt retries", () => {
 
                 await agent.request(methods.session.resume, {cwd, sessionId, replayFrom: {type: "start"}});
                 const replayed = updates.filter(({update}) => acp.SessionUpdate.isUserMessageChunk(update));
-                expect(replayed).toEqual([expect.objectContaining({update: expect.objectContaining({messageId})})]);
+                expect(replayed).toEqual([messageId, secondMessageId]
+                    .map(id => expect.objectContaining({update: expect.objectContaining({messageId: id})})));
                 expect(JSON.stringify(updates)).not.toContain(prompt.idempotencyKey);
 
-                const fork = await agent.request(methods.session.fork, {cwd, sessionId});
+                const cursor = updates.find(({update}) => acp.SessionUpdate.isCursorUpdate(update))?.update;
+                expect(cursor).toMatchObject({anchor: {type: "user_message", messageId: secondMessageId, position: "before"}});
+                if (!cursor || !acp.SessionUpdate.isCursorUpdate(cursor)) throw new Error("Missing fork cursor");
+                const fork = await agent.request(methods.session.fork, {cwd, sessionId, cursorId: cursor.cursorId});
+                await agent.request(methods.session.resume, {cwd, sessionId: fork.sessionId, replayFrom: {type: "start"}});
+                const forkReplay = updates.filter(({sessionId: id, update}) =>
+                    id === fork.sessionId && acp.SessionUpdate.isUserMessageChunk(update));
+                expect(forkReplay).toEqual([expect.objectContaining({update: expect.objectContaining({messageId})})]);
                 const forkReceipt = await agent.request(methods.session.prompt, {...prompt, sessionId: fork.sessionId});
                 expect(forkReceipt.messageId).not.toBe(messageId);
                 await waitForIdle(updates, fork.sessionId);

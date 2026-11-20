@@ -59,6 +59,7 @@ import {
 import type * as acpV2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {toV1ClientCapabilitiesView} from "./AcpV2ClientCapabilities";
 import {toV1SetSessionConfigOptionRequest, toV2ConfigOptions} from "./AcpV2ConfigOptions";
+import {issueForkCursor} from "./SessionForkCursor";
 import {toV2AvailableCommands} from "./AcpV2SessionUpdate";
 import {changesSystemPrompt, clientSystemPromptText, toV1SystemPrompt, type SessionInstructions} from "./ClientSystemPrompt";
 import {
@@ -2086,8 +2087,8 @@ export class CodexAcpServer {
     }
 
     async forkSession(params: WithAcpMcpServers<acp.ForkSessionRequest>): Promise<acp.ForkSessionResponse> {
-        if (params.cursorId != null) {
-            throw RequestError.invalidParams(undefined, "Forking at a session cursor is not supported");
+        if (params.cursorId != null && this.protocolVersion !== 2) {
+            throw RequestError.invalidParams(undefined, "Forking at a session cursor requires ACP v2");
         }
         clientSystemPromptText(params.systemPrompt);
         this.assertInstructionsReady(params.sessionId);
@@ -3812,14 +3813,15 @@ export class CodexAcpServer {
         const entryPages = pagesStartingWith(firstPage, pages);
         // Hiding the `/review` reviewer prompt is a v2-only change (user decision): v1 keeps
         // showing it, as it always has.
-        const itemPages = untilSessionClose(
-            this.protocolVersion === 2 ? withoutReviewerPrompts(entryPages) : itemsOfEntries(entryPages),
+        const historyPages = untilSessionClose(
+            this.protocolVersion === 2 ? withoutReviewerPrompts(withForkBoundaries(entryPages)) : entryPages,
             isOpen,
         );
         if (this.usesStandardSubagents()) {
-            await this.streamStandardHistory(sessionId, standardHistoryItems(itemPages), sessionState, isOpen);
+            await this.streamStandardHistory(sessionId, standardHistoryItems(historyPages), sessionState, isOpen);
             return;
         }
+        const itemPages = itemsOfEntries(historyPages);
         if (this.supportsNativeSubagents()) {
             await this.streamNativeThreadHistory(
                 sessionId,
@@ -4031,7 +4033,7 @@ export class CodexAcpServer {
                     else if (threadId !== state.sessionId) await router.replayTurnOutcome(threadId, entry.turn);
                     continue;
                 }
-                const {item, completed, turnId} = entry;
+                const {item, completed, turnId, previousTurnId} = entry;
                 if (item.type === "subAgentActivity") {
                     if (isRootAgentPath(item.agentPath)) continue;
                     if (ancestry.has(item.agentThreadId)) { gaps.add(item.agentThreadId); continue; }
@@ -4064,8 +4066,25 @@ export class CodexAcpServer {
                     // Agent-owned input is a message between sessions, not an ordinary human message.
                     if (item.type === "userMessage") { await router.reportIncomingMessage(threadId, item); continue; }
                 }
-                for (const update of await this.createHistoryUpdates(item, state)) {
+                const updates = await this.createHistoryUpdates(item, state);
+                for (const update of updates) {
                     await session.replayUpdate(update, replayedEntities);
+                }
+                if (this.protocolVersion === 2 && threadId === state.sessionId && previousTurnId !== undefined
+                    && turnId !== undefined && item.type === "userMessage" && updates.length > 0) {
+                    const home = this.codexAcpClient.getHomePath();
+                    if (home !== null) {
+                        const cursorId = await issueForkCursor(home, {
+                            sessionId, previousTurnId, turnId, itemId: item.id,
+                        }).catch(error => {
+                            logger.error("Could not retain a session fork cursor", {sessionId, error});
+                            return null;
+                        });
+                        if (cursorId !== null) await session.replayUpdate({
+                            sessionUpdate: "cursor_update", cursorId, capabilities: {fork: {}},
+                            anchor: {type: "user_message", messageId: item.clientId ?? item.id, position: "before"},
+                        }, replayedEntities);
+                    }
                 }
             }
         }
@@ -5896,6 +5915,21 @@ export class CodexAcpServer {
     }
 }
 
+type HistoryEntry = ThreadItemEntry & {previousTurnId?: string};
+
+/** Codex can cut a fork after a whole turn. Only anchor exact turn boundaries. */
+async function* withForkBoundaries(pages: AsyncIterable<ThreadItemEntry[]>): AsyncGenerator<HistoryEntry[]> {
+    let previousTurnId: string | undefined;
+    for await (const page of pages) {
+        yield page.map(entry => {
+            const boundary = previousTurnId !== entry.turnId && entry.item.type === "userMessage"
+                ? previousTurnId : undefined;
+            previousTurnId = entry.turnId;
+            return boundary === undefined ? entry : {...entry, previousTurnId: boundary};
+        });
+    }
+}
+
 /** A buffered reviewer prompt candidate is shown once its turn has this many items. */
 const REVIEWER_PROMPT_CANDIDATE_MAX_ITEMS = 100;
 
@@ -5907,11 +5941,11 @@ const REVIEWER_PROMPT_CANDIDATE_MAX_ITEMS = 100;
  * except that T is minted *after* P: its UUIDv7 turn id sorts higher. Only a turn that can be T is
  * held back, until the first item of the next turn decides.
  */
-async function* withoutReviewerPrompts(pages: AsyncIterable<ThreadItemEntry[]>): AsyncGenerator<ThreadItem[]> {
+async function* withoutReviewerPrompts(pages: AsyncIterable<HistoryEntry[]>): AsyncGenerator<HistoryEntry[]> {
     let turnId: string | null = null;
-    let candidate: {turnId: string; items: ThreadItem[]} | null = null;
+    let candidate: {turnId: string; items: HistoryEntry[]} | null = null;
     for await (const page of pages) {
-        const items: ThreadItem[] = [];
+        const items: HistoryEntry[] = [];
         for (const entry of page) {
             const item = entry.item;
             const turnStarts = entry.turnId !== turnId;
@@ -5923,14 +5957,14 @@ async function* withoutReviewerPrompts(pages: AsyncIterable<ThreadItemEntry[]>):
                 candidate = null;
             }
             if (turnStarts && item.type === "userMessage" && item.clientId === null) {
-                candidate = {turnId: entry.turnId, items: [item]};
+                candidate = {turnId: entry.turnId, items: [entry]};
                 continue;
             }
             if (candidate === null) {
-                items.push(item);
+                items.push(entry);
                 continue;
             }
-            candidate.items.push(item);
+            candidate.items.push(entry);
             // A turn with its own messages is not a reviewer prompt turn.
             if (item.type === "agentMessage" || item.type === "userMessage"
                 || candidate.items.length >= REVIEWER_PROMPT_CANDIDATE_MAX_ITEMS) {
@@ -5950,9 +5984,12 @@ async function* itemsOfEntries(pages: AsyncIterable<ThreadItemEntry[]>): AsyncGe
     }
 }
 
-async function* standardHistoryItems(pages: AsyncIterable<ThreadItem[]>): AsyncGenerator<RecordedSubagentEntry[]> {
+async function* standardHistoryItems(pages: AsyncIterable<HistoryEntry[]>): AsyncGenerator<RecordedSubagentEntry[]> {
     for await (const page of pages) {
-        yield page.map(item => ({item, completed: !("status" in item) || item.status !== "inProgress"}));
+        yield page.map(({item, turnId, previousTurnId}) => ({
+            item, turnId, ...(previousTurnId === undefined ? {} : {previousTurnId}),
+            completed: !("status" in item) || item.status !== "inProgress",
+        }));
     }
 }
 

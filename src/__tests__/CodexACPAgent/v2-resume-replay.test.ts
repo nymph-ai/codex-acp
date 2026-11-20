@@ -1,3 +1,6 @@
+import {mkdtemp, rm} from "node:fs/promises";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import * as acp from '@agentclientprotocol/sdk/unstable';
 import * as acpV2 from '@agentclientprotocol/sdk/experimental/v2/unstable';
@@ -198,6 +201,11 @@ function codexResponse(
                 serviceTier: null,
                 itemsBackwardsCursor: paginated ? "last" : null,
             };
+        case "thread/fork":
+            return {
+                ...codexResponse("thread/start", undefined) as object,
+                thread: createThread({id: "fork", sessionId: "fork"}),
+            };
         case "thread/read":
             return {thread: createThread({turns: replayTurns})};
         case "model/list":
@@ -220,12 +228,14 @@ async function connectV2Client(options?: {
     replayTurns?: Thread["turns"];
     capabilities?: acpV2.ClientCapabilities;
     paginated?: boolean;
+    codexHome?: string;
 }) {
     const mocks = createMockConnections();
     mocks.mockCodexConnection.sendRequest.mockImplementation(async (method: string, params?: any) => (
         codexResponse(method, params, options?.replayTurns, options?.paginated)
     ));
     const codexAcpClient = new CodexAcpClient(new CodexAppServerClient(mocks.mockCodexConnection as any));
+    if (options?.codexHome) vi.spyOn(codexAcpClient, "getHomePath").mockReturnValue(options.codexHome);
     vi.spyOn(codexAcpClient, "readAuthRequirement").mockResolvedValue({required: false, account: null});
     vi.spyOn(codexAcpClient, "getAgentConfiguredModelProvider").mockResolvedValue("openai");
     vi.spyOn(codexAcpClient, "getAccount").mockResolvedValue({account: null, userId: null, requiresOpenaiAuth: false});
@@ -247,8 +257,8 @@ async function connectV2Client(options?: {
         info: {name: "test-client", version: "1.0.0"},
         ...(options?.capabilities ? {capabilities: options.capabilities} : {}),
     });
-    const codexMethods = () => mocks.mockCodexConnection.sendRequest.mock.calls.map((call: unknown[]) => call[0] as string);
-    return {connection, updates, codexMethods};
+    const codexMethods = (): string[] => mocks.mockCodexConnection.sendRequest.mock.calls.map((call: unknown[]) => call[0] as string);
+    return {connection, updates, codexMethods, codexRequests: mocks.mockCodexConnection.sendRequest.mock.calls};
 }
 
 function dump(value: unknown): string {
@@ -304,6 +314,50 @@ describe('ACP v2 resume replay: review-mode ids, reviewer-prompt hiding, primers
         closeClient = null;
         vi.clearAllMocks();
         expectConformingV2SessionUpdates();
+    });
+
+    it("replays a fork cursor before a user message and accepts it on another connection", async () => {
+        const codexHome = await mkdtemp(join(tmpdir(), "codex-acp-fork-"));
+        const replayTurns: Thread["turns"] = ["first", "second"].map(id => ({
+            ...createTurn("completed", id),
+            items: [{type: "userMessage", id, clientId: `client-${id}`,
+                content: [{type: "text", text: id, text_elements: []}]}],
+        }));
+        const first = await connectV2Client({codexHome, replayTurns});
+        try {
+            await first.connection.agent.request(acpV2.methods.agent.session.resume, {
+                sessionId, cwd, replayFrom: {type: "start"},
+            });
+            const cursorIndex = first.updates.findIndex(({update}) => update.sessionUpdate === "cursor_update");
+            const cursor = first.updates[cursorIndex]?.update;
+            expect(cursor).toMatchObject({
+                sessionUpdate: "cursor_update",
+                capabilities: {fork: {}},
+                anchor: {type: "user_message", messageId: "client-second", position: "before"},
+            });
+            expect(first.updates.slice(0, cursorIndex).some(({update}) =>
+                update.sessionUpdate === "user_message" && update.messageId === "client-second")).toBe(true);
+            if (!acpV2.SessionUpdate.isCursorUpdate(cursor!)) throw new Error("Missing replay cursor");
+
+            const second = await connectV2Client({codexHome, replayTurns});
+            try {
+                const request = {sessionId, cwd, cursorId: cursor.cursorId};
+                await expect(second.connection.agent.request(acpV2.methods.agent.session.fork, request))
+                    .resolves.toMatchObject({sessionId: "fork"});
+                expect(second.codexRequests).toContainEqual(["thread/fork", expect.objectContaining({
+                    threadId: sessionId, lastTurnId: "first",
+                })]);
+                await expect(second.connection.agent.request(acpV2.methods.agent.session.fork, {
+                    ...request, sessionId: "another-thread",
+                })).rejects.toMatchObject({code: -32602});
+                expect(second.codexMethods().filter(method => method === "thread/fork")).toHaveLength(1);
+            } finally {
+                second.connection.close();
+            }
+        } finally {
+            first.connection.close();
+            await rm(codexHome, {recursive: true, force: true});
+        }
     });
 
     it('gives review-mode chunks a stable messageId, hides only the minted-after reviewer prompt, and primes every replayed chunk', async () => {
