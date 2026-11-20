@@ -3253,21 +3253,19 @@ export class CodexAcpServer {
         const receipt = {outcome: "injected", messageId} as const;
         const retained = async () => (await this.codexAcpClient.readRetainedPromptIds(sessionId)).has(messageId);
         const unknown = () => new RequestError(-32603, "Codex steer insertion is unconfirmed");
-        if (await retained()) return receipt;
         const path = join(directory, messageId);
-        const turnId = await this.getSteerableTurnId(sessionState);
-        if (!turnId) {
-            try {
-                await access(path);
-            } catch (error) {
-                if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-                    return {outcome: "promptRequired", reason: "noRunningTurn"};
-                }
-                throw error;
-            }
+        // A newly opened idle thread may have no materialized native history yet.
+        // Every dispatch creates a fence first, so only an existing fence needs history.
+        const wasDispatched = await access(path).then(() => true, error => {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+            throw error;
+        });
+        if (wasDispatched) {
             if (await retained()) return receipt;
             throw unknown();
         }
+        const turnId = await this.getSteerableTurnId(sessionState);
+        if (!turnId) return {outcome: "promptRequired", reason: "noRunningTurn"};
 
         // A retained native row is positive evidence. Its absence is inconclusive
         // once any adapter has taken the durable right to dispatch this key.
