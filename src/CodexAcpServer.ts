@@ -66,9 +66,12 @@ import {toV2AvailableCommands} from "./AcpV2SessionUpdate";
 import {changesSystemPrompt, clientSystemPromptText, toV1SystemPrompt, type SessionInstructions} from "./ClientSystemPrompt";
 import {
     AcpV2PromptKeys,
+    deleteCommandReceipts,
+    hasCommandReceipt,
     isInsertedUserMessage,
     keyedPromptId,
     postInsertionFailureText,
+    retainCommandReceipt,
     toV1PromptRequest,
     assertPromptContentSupported,
     toV2Failure,
@@ -2296,6 +2299,9 @@ export class CodexAcpServer {
             } else {
                 await this.runWithProcessCheck(() => this.codexAcpClient.deleteSession(sessionId));
             }
+            await deleteCommandReceipts(this.codexAcpClient.getHomePath(), sessionId).catch(error => {
+                logger.error(`Failed to delete command receipts for session ${sessionId}`, error);
+            });
             logger.log("Session deleted", {sessionId});
         } finally {
             this.endSessionCloseFence(sessionId);
@@ -4880,10 +4886,15 @@ export class CodexAcpServer {
             const messageId = keyedPromptId(sessionId, idempotencyKey);
             const keys = this.v2PromptKeys.get(sessionId) ?? new AcpV2PromptKeys();
             this.v2PromptKeys.set(sessionId, keys);
-            const findRetained = () => keys.hasRetainedMessage(messageId, () => sessionState.threadHasHistory
-                ? this.runWithProcessCheck(() => this.codexAcpClient.readRetainedPromptIds(sessionId))
-                : Promise.resolve(new Set<string>()));
-            return keys.submit(messageId, signal, sharedSignal => this.insertPromptV2(request, messageId, sharedSignal, findRetained));
+            const home = this.codexAcpClient.getHomePath();
+            const keyed = {
+                findRetained: async () => await hasCommandReceipt(home, sessionId, messageId)
+                    || await keys.hasRetainedMessage(messageId, () => sessionState.threadHasHistory
+                        ? this.runWithProcessCheck(() => this.codexAcpClient.readRetainedPromptIds(sessionId))
+                        : Promise.resolve(new Set<string>())),
+                retainCommand: home === null ? undefined : () => retainCommandReceipt(home, sessionId, messageId),
+            };
+            return keys.submit(messageId, signal, sharedSignal => this.insertPromptV2(request, messageId, sharedSignal, keyed));
         } catch (error) {
             return Promise.reject(error);
         }
@@ -4893,7 +4904,7 @@ export class CodexAcpServer {
         request: acp.PromptRequest,
         messageId: string,
         signal?: AbortSignal,
-        findRetained?: () => Promise<boolean>,
+        keyed?: {findRetained: () => Promise<boolean>; retainCommand: (() => Promise<boolean>) | undefined},
     ): Promise<acpV2.PromptResponse> {
         throwIfRequestCancelled(signal);
         const {sessionId} = request;
@@ -4901,12 +4912,12 @@ export class CodexAcpServer {
         // session's place in the shared turn-start FIFO now (before any await), then wait. Nothing
         // observable happens until it reaches the front, unless the ID already exists in history.
         const reservation = this.acquireTurnStartReservation(sessionId);
-        if (reservation.needsWait || findRetained) {
+        if (reservation.needsWait || keyed) {
             const drop = new AbortController();
             const waiting = signal ? AbortSignal.any([signal, drop.signal]) : drop.signal;
             const unregister = this.registerQueuedV2PromptCanceller(sessionId, () => drop.abort());
             try {
-                if (findRetained && await withRequestCancellation(findRetained(), waiting)) {
+                if (keyed && await withRequestCancellation(keyed.findRetained(), waiting)) {
                     // A retry doesn't wait for unrelated work, but its slot can't let a new prompt jump the queue.
                     void reservation.wait.then(() => reservation.release());
                     return {messageId};
@@ -4926,9 +4937,21 @@ export class CodexAcpServer {
         // For keyed prompts we only honor request cancellation while the submission is held.
         // Once dispatched, Codex can still insert the message (even if interrupted), so answer
         // all attempts from the actual insertion result rather than prematurely forgetting the key.
-        const inFlightSignal = findRetained === undefined ? signal : undefined;
-        const sessionState = this.getSessionState(sessionId);
+        const inFlightSignal = keyed === undefined ? signal : undefined;
         const promptKind = this.availableCommands.classifyPrompt(request.prompt);
+        const retainCommand = promptKind.kind === "prompt" ? undefined : keyed?.retainCommand;
+        if (retainCommand) {
+            try {
+                if (!await retainCommand()) {
+                    reservation.release();
+                    return {messageId};
+                }
+            } catch (error) {
+                reservation.release();
+                throw error;
+            }
+        }
+        const sessionState = this.getSessionState(sessionId);
         const session = new ACPSessionConnection(this.connection, sessionId);
         let failure: acpV2.Error | null = null;
         const generation = this.getSessionGeneration(sessionId);
@@ -4993,6 +5016,7 @@ export class CodexAcpServer {
                 }
             }
             const onInserted = async () => {
+                if (inserted) return;
                 inserted = true;
                 try {
                     for (const block of request.prompt) {
@@ -5010,7 +5034,7 @@ export class CodexAcpServer {
                 await running;
             };
             const run = async () => {
-                if (promptKind.kind === "localCommand") {
+                if (promptKind.kind === "localCommand" || retainCommand) {
                     await onInserted();
                 }
                 return await this.prompt(request, undefined, undefined, {
@@ -5031,7 +5055,7 @@ export class CodexAcpServer {
                     onTurnStarted: (turn) => {
                         startedTurn = turn;
                         // An accepted Codex turn can run hooks before inserting user input.
-                        running = startWork();
+                        running ??= startWork();
                     },
                     onFailure: (error) => { failure ??= error; },
                 }, reservation);

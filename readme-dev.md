@@ -176,6 +176,11 @@ v1 `modes` field (v2 removed the modes API in favor of config options), and fork
 get an `available_commands_update`, matching v1. There are no new environment/config knobs specific
 to v2; it reuses the runtime environment variables above. See [session fork cursors](docs/session-fork-cursors.md) for historical forks.
 
+ACP v2 keyed slash commands store the insertion receipt under `acp-command-receipts`
+in the local Codex home. Keep that directory with the native session data when
+replacing the adapter. A retry returns the original message ID without running
+the command again. Slash command transcripts are live-only.
+
 #### Client system prompts
 
 Both ACP versions advertise `systemPrompt: {}`: text-only `append` mode. Override and non-text

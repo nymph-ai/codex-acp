@@ -74,13 +74,17 @@ describeIntegration("integration: ACP v2 prompt retries", () => {
                 {type: "image", mimeType: "image/png", data: image},
             ],
         } satisfies Pick<acp.PromptRequest, "idempotencyKey" | "prompt">;
+        const statusPrompt = {
+            idempotencyKey: "status-submission-key",
+            prompt: [{type: "text", text: "/status"}],
+        } satisfies Pick<acp.PromptRequest, "idempotencyKey" | "prompt">;
         const waitForIdle = (updates: acp.UpdateSessionNotification[], session: string, count = 1) => vi.waitFor(() => {
             expect(updates.filter(({sessionId, update}) => sessionId === session
                 && acp.SessionUpdate.isStateUpdate(update) && update.state === "idle"
                 && "stopReason" in update && update.stopReason === "end_turn")).toHaveLength(count);
         }, {timeout: 10_000});
         try {
-            const {sessionId, messageId, secondMessageId} = await withAgent(async (agent, updates) => {
+            const {sessionId, messageId, secondMessageId, statusMessageId} = await withAgent(async (agent, updates) => {
                 const {sessionId} = await agent.request(methods.session.new, {cwd});
                 const {messageId} = await agent.request(methods.session.prompt, {sessionId, ...prompt});
                 await waitForIdle(updates, sessionId);
@@ -90,8 +94,10 @@ describeIntegration("integration: ACP v2 prompt retries", () => {
                 expect(providerInputs.includes("file:///context-fixture.txt")).toBe(true);
                 expect(providerInputs.includes("Retained embedded context")).toBe(true);
                 expect(/"type":"input_image","image_url":"data:image\//.test(providerInputs)).toBe(true);
+                const {messageId: statusMessageId} = await agent.request(methods.session.prompt, {sessionId, ...statusPrompt});
+                await waitForIdle(updates, sessionId, 3);
                 await agent.request(methods.session.close, {sessionId});
-                return {sessionId, messageId, secondMessageId};
+                return {sessionId, messageId, secondMessageId, statusMessageId};
             });
             await withAgent(async (agent, updates) => {
                 const calls = mock.requests.length;
@@ -99,6 +105,8 @@ describeIntegration("integration: ACP v2 prompt retries", () => {
                 await expect(agent.request(methods.session.prompt, {sessionId, ...prompt})).resolves.toEqual({messageId});
                 await expect(agent.request(methods.session.prompt, {sessionId, ...contextPrompt}))
                     .resolves.toEqual({messageId: secondMessageId});
+                await expect(agent.request(methods.session.prompt, {sessionId, ...statusPrompt}))
+                    .resolves.toEqual({messageId: statusMessageId});
                 expect(mock.requests).toHaveLength(calls);
                 expect(updates.some(({update}) => acp.SessionUpdate.isUserMessageChunk(update))).toBe(false);
 

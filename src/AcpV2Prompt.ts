@@ -4,7 +4,9 @@ import type {ServerNotification} from "./app-server";
 import {CODEX_PROCESS_EXITED_ERROR_CODE} from "./app-server-recovery/AppServerExit";
 import {readableServiceErrorMessage} from "./ServiceErrorMessage";
 import {ResponseError} from "vscode-jsonrpc";
-import {createHash} from "node:crypto";
+import {createHash, randomUUID} from "node:crypto";
+import {link, mkdir, open, readFile, rm, writeFile} from "node:fs/promises";
+import {dirname, join} from "node:path";
 
 // Keep the derivation stable: changing it would make stored receipts look unused.
 const KEYED_PROMPT_ID_PREFIX = "acp-prompt-v1:";
@@ -16,6 +18,68 @@ export function keyedPromptId(sessionId: string, key: acpV2.IdempotencyKey): str
 
 export function isKeyedPromptId(id: string): boolean {
     return id.startsWith(KEYED_PROMPT_ID_PREFIX);
+}
+
+function commandReceiptDirectory(home: string, sessionId: string): string {
+    const session = createHash("sha256").update(sessionId).digest("hex");
+    return join(home, "acp-command-receipts", session);
+}
+
+function commandReceiptPath(home: string, sessionId: string, messageId: string): string {
+    return join(commandReceiptDirectory(home, sessionId), messageId.slice(KEYED_PROMPT_ID_PREFIX.length));
+}
+
+export async function hasCommandReceipt(home: string | null, sessionId: string, messageId: string): Promise<boolean> {
+    if (home === null) return false;
+    const path = commandReceiptPath(home, sessionId, messageId);
+    try {
+        if (await readFile(path, "utf8") !== messageId) throw new Error("Invalid retained ACP command receipt");
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+    }
+    await syncCommandReceipt(home, dirname(path));
+    return true;
+}
+
+/** Commands leave no native user ID. Record the insertion receipt before doing work. */
+export async function retainCommandReceipt(home: string, sessionId: string, messageId: string): Promise<boolean> {
+    const path = commandReceiptPath(home, sessionId, messageId);
+    const directory = dirname(path);
+    await mkdir(directory, {recursive: true, mode: 0o700});
+    const staging = join(directory, randomUUID());
+    try {
+        await writeFile(staging, messageId, {flag: "wx", mode: 0o600, flush: true});
+        // The final name becomes visible with complete content and can only be claimed once.
+        const claimed = await link(staging, path).then(() => true, error => {
+            if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+            throw error;
+        });
+        if (claimed) {
+            await syncCommandReceipt(home, directory);
+        } else if (!await hasCommandReceipt(home, sessionId, messageId)) {
+            throw new Error("ACP command receipt disappeared before it could be read");
+        }
+        return claimed;
+    } finally {
+        await rm(staging, {force: true});
+    }
+}
+
+async function syncCommandReceipt(home: string, directory: string): Promise<void> {
+    if (process.platform === "win32") return;
+    for (const parent of [directory, dirname(directory), home]) {
+        const handle = await open(parent, "r");
+        try {
+            await handle.sync();
+        } finally {
+            await handle.close();
+        }
+    }
+}
+
+export async function deleteCommandReceipts(home: string | null, sessionId: string): Promise<void> {
+    if (home !== null) await rm(commandReceiptDirectory(home, sessionId), {recursive: true, force: true});
 }
 
 /** Lives for one active session, including re-resumes on the same connection. */
