@@ -20,6 +20,7 @@ describe.each([1, 2] as const)("ACP v%s SDK upgrade capabilities", version => {
                 await expect(h.request(method, {sessionId})).rejects.toMatchObject({code: -32601});
             }
             if (version === 2) {
+                expect(initialize.result["_meta"]).toMatchObject({"nymph.ai/fabric": {keyedTextPrompts: true}});
                 await expect(h.request("tool_call/cancel", {sessionId, toolCallId: "tool"})).rejects.toMatchObject({code: -32601});
                 await expect(h.request("terminal/cancel", {sessionId, terminalId: "unknown"})).rejects.toMatchObject({code: -32602});
             }

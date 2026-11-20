@@ -946,7 +946,10 @@ export class CodexAcpServer {
                 },
             },
             authMethods: getCodexAuthMethodsV2(clientCapabilities),
-            _meta: this.initializeExtensionsMeta(2),
+            _meta: {
+                ...this.initializeExtensionsMeta(2),
+                "nymph.ai/fabric": {keyedTextPrompts: true},
+            },
         };
     }
 
